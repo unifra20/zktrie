@@ -105,23 +105,22 @@ func (t *ZkTrie) TryDelete(key []byte) error {
 	}
 
 	kHash := zkt.NewHashFromBigInt(k)
-	//mitigate the create-delete issue: do not delete unexisted key
-	if r, _ := t.tree.TryGet(kHash); r == nil {
-		return nil
-	}
-
 	return t.tree.tryDeleteLite(kHash)
 }
 
 // Hash returns the root hash of SecureBinaryTrie. It does not write to the
 // database and can be used even if the trie doesn't have one.
 func (t *ZkTrie) Hash() []byte {
-	return t.tree.rootKey.Bytes()
+	return (*t.tree.Root()).Bytes()
+}
+
+func (t *ZkTrie) Commit() error {
+	return t.tree.Commit()
 }
 
 // Copy returns a copy of SecureBinaryTrie.
 func (t *ZkTrie) Copy() *ZkTrie {
-	cpy, err := NewZkTrieImplWithRoot(t.tree.db, t.tree.rootKey, t.tree.maxLevels)
+	cpy, err := NewZkTrieImplWithRoot(t.tree.db, t.tree.Root(), t.tree.maxLevels)
 	if err != nil {
 		panic("clone trie failed")
 	}

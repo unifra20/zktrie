@@ -1,10 +1,12 @@
 package trie
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
 	"reflect"
+	"sync"
 	"unsafe"
 
 	zkt "github.com/scroll-tech/zktrie/types"
@@ -52,9 +54,66 @@ type Node struct {
 	KeyPreimage *zkt.Byte32
 }
 
+type (
+	node interface {
+		Key() (*zkt.Hash, error)
+	}
+
+	hashNode struct {
+		*zkt.Hash
+	}
+
+	nodeFlag struct {
+		cached hashNode // cached hash of the node (may be nil)
+		dirty  bool     // whether the node has changes that must be written to the database
+	}
+
+	emptyNode struct{}
+	midNode   struct {
+		childL node
+		childR node
+		flags  nodeFlag
+	}
+	leafNode struct {
+		// NodeKey is the node's key stored in a leaf node.
+		NodeKey *zkt.Hash
+		// ValuePreimage can store at most 256 byte32 as fields (represnted by BIG-ENDIAN integer)
+		// and the first 24 can be compressed (each bytes32 consider as 2 fields), in hashing the compressed
+		// elemments would be calculated first
+		ValuePreimage []zkt.Byte32
+		// CompressedFlags use each bit for indicating the compressed flag for the first 24 fields
+		CompressedFlags uint32
+		// key is the cache of entry key used to avoid recalculating
+		key *zkt.Hash
+		// valueHash is the cache of hashes of valuePreimage, used to avoid recalculating
+		valueHash *zkt.Hash
+		// KeyPreimage is kept here only for proof
+		KeyPreimage *zkt.Byte32
+	}
+)
+
+var Empty = emptyNode{}
+var midNodePool = sync.Pool{
+	New: func() interface{} {
+		return &midNode{
+			childL: &Empty,
+			childR: &Empty,
+			flags:  nodeFlag{dirty: true, cached: hashNode{nil}},
+		}
+	},
+}
+
+func recyclingMidNode(n *midNode) {
+	n.childL = &Empty
+	n.childR = &Empty
+	n.flags.dirty = true
+	n.flags.cached = hashNode{nil}
+	midNodePool.Put(n)
+}
+
 // NewNodeLeaf creates a new leaf node.
-func NewNodeLeaf(k *zkt.Hash, valueFlags uint32, valuePreimage []zkt.Byte32) *Node {
-	return &Node{Type: NodeTypeLeaf, NodeKey: k, CompressedFlags: valueFlags, ValuePreimage: valuePreimage}
+func NewNodeLeaf(nodeKey *zkt.Hash, compressedFlags uint32, valuePreimage []zkt.Byte32) *Node {
+	return &Node{Type: NodeTypeLeaf, NodeKey: nodeKey, CompressedFlags: compressedFlags, ValuePreimage: valuePreimage}
 }
 
 // NewNodeMiddle creates a new middle node.
@@ -107,6 +166,62 @@ func NewNodeFromBytes(b []byte) (*Node, error) {
 		return nil, ErrInvalidNodeFound
 	}
 	return &n, nil
+}
+
+// NewNodeFromBytes creates a new node by parsing the input []byte.
+func nodeFromBytes(kHash hashNode, b []byte) (node, error) {
+	if len(b) < 1 {
+		return nil, ErrNodeBytesBadSize
+	}
+	nType := b[0]
+	b = b[1:]
+	switch NodeType(nType) {
+	case NodeTypeMiddle:
+		if len(b) != 2*zkt.ElemBytesLen {
+			return nil, ErrNodeBytesBadSize
+		}
+
+		n := midNodePool.Get().(*midNode)
+		n.flags.cached = kHash
+		n.flags.dirty = false
+
+		if !bytes.Equal(b[:zkt.ElemBytesLen], zkt.HashZero[:]) {
+			n.childL = hashNode{zkt.NewHashFromBytes(b[:zkt.ElemBytesLen])}
+		}
+		if !bytes.Equal(b[zkt.ElemBytesLen:zkt.ElemBytesLen*2], zkt.HashZero[:]) {
+			n.childR = hashNode{zkt.NewHashFromBytes(b[zkt.ElemBytesLen : zkt.ElemBytesLen*2])}
+		}
+
+		return n, nil
+
+	case NodeTypeLeaf:
+		if len(b) < zkt.ElemBytesLen+4 {
+			return nil, ErrNodeBytesBadSize
+		}
+		n := &leafNode{}
+		n.NodeKey = zkt.NewHashFromBytes(b[0:32])
+		n.key = kHash.Hash
+		mark := binary.LittleEndian.Uint32(b[32:36])
+		preimageLen := int(mark & 255)
+		n.CompressedFlags = mark >> 8
+		n.ValuePreimage = make([]zkt.Byte32, preimageLen)
+		curPos := 36
+		for i := 0; i < preimageLen; i++ {
+			copy(n.ValuePreimage[i][:], b[i*32+curPos:(i+1)*32+curPos])
+		}
+		curPos = 36 + preimageLen*32
+		preImageSize := int(b[curPos])
+		curPos += 1
+		if preImageSize != 0 {
+			n.KeyPreimage = new(zkt.Byte32)
+			copy(n.KeyPreimage[:], b[curPos:curPos+preImageSize])
+		}
+		return n, nil
+	case NodeTypeEmpty:
+		return &Empty, nil
+	default:
+		return nil, ErrInvalidNodeFound
+	}
 }
 
 // LeafKey computes the key of a leaf node given the hIndex and hValue of the
@@ -228,4 +343,61 @@ func (n *Node) String() string {
 	default:
 		return "Invalid Node"
 	}
+}
+
+func (n *midNode) CanonicalValue() []byte {
+	bytes := []byte{byte(NodeTypeMiddle)}
+
+	l, _ := n.childL.Key()
+	r, _ := n.childR.Key()
+	bytes = append(bytes, l.Bytes()...)
+	bytes = append(bytes, r.Bytes()...)
+	return bytes
+}
+
+func (n *leafNode) CanonicalValue() []byte {
+	bytes := []byte{byte(NodeTypeLeaf)}
+	bytes = append(bytes, n.NodeKey.Bytes()...)
+	tmp := make([]byte, 4)
+	compressedFlag := (n.CompressedFlags << 8) + uint32(len(n.ValuePreimage))
+	binary.LittleEndian.PutUint32(tmp, compressedFlag)
+	bytes = append(bytes, tmp...)
+	for _, elm := range n.ValuePreimage {
+		bytes = append(bytes, elm[:]...)
+	}
+	bytes = append(bytes, 0)
+	return bytes
+}
+
+func (n hashNode) Key() (*zkt.Hash, error) {
+	return n.Hash, nil
+}
+func (n *midNode) Key() (*zkt.Hash, error) {
+	return n.flags.cached.Hash, nil
+}
+func (n *emptyNode) Key() (*zkt.Hash, error) {
+	return &zkt.HashZero, nil
+}
+func (n *leafNode) Key() (*zkt.Hash, error) {
+	if n.key != nil {
+		return n.key, nil
+	}
+	var err error
+	n.valueHash, err = zkt.PreHandlingElems(n.CompressedFlags, n.ValuePreimage)
+	if err != nil {
+		return nil, err
+	}
+
+	n.key, err = LeafKey(n.NodeKey, n.valueHash)
+	return n.key, err
+}
+
+func (n leafNode) Data() []byte {
+	var data []byte
+	hdata := (*reflect.SliceHeader)(unsafe.Pointer(&data))
+	//TODO: uintptr(reflect.ValueOf(n.ValuePreimage).UnsafePointer()) should be more elegant but only available until go 1.18
+	hdata.Data = uintptr(unsafe.Pointer(&n.ValuePreimage[0]))
+	hdata.Len = 32 * len(n.ValuePreimage)
+	hdata.Cap = hdata.Len
+	return data
 }
