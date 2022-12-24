@@ -58,6 +58,7 @@ extern "C" {
     fn FreeTrieNode(node: *const TrieNode);
     fn TrieNodeKey(node: *const TrieNode) -> *const u8;
     fn TrieLeafNodeValueHash(node: *const TrieNode) -> *const u8;
+    fn TrieCommit(trie:*const Trie);
 }
 
 pub fn init_hash_scheme(f: HashScheme) {
@@ -288,6 +289,9 @@ impl ZkTrie {
         unsafe {
             TrieDelete(self.trie, key.as_ptr(), key.len() as c_int);
         }
+    }
+    pub fn commit(&mut self){
+      TrieCommit(self.trie)
     }
 }
 

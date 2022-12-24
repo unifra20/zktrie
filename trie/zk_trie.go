@@ -114,7 +114,7 @@ func (t *ZkTrie) Hash() []byte {
 	return (*t.tree.Root()).Bytes()
 }
 
-func (t *ZkTrie) Commit() error {
+func (t *ZkTrie) Commit() (*zkt.Hash, int, error) {
 	return t.tree.Commit()
 }
 

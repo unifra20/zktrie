@@ -43,10 +43,13 @@ func (mt *ZkTrieImpl) prove(kHash *zkt.Hash, fromLevel uint, writeNode func(*Nod
 				return err
 			}
 		}
+
 		switch tn := n.(type) {
 		case *leafNode:
+			nodes = append(nodes, toNode(n))
 		case *emptyNode:
 		case *midNode:
+			nodes = append(nodes, toNode(n))
 			finished = false
 			if path[i] {
 				n = tn.childR
@@ -56,7 +59,7 @@ func (mt *ZkTrieImpl) prove(kHash *zkt.Hash, fromLevel uint, writeNode func(*Nod
 		default:
 			return ErrInvalidNodeFound
 		}
-		nodes = append(nodes, toNode(n))
+
 		if finished {
 			break
 		}

@@ -75,33 +75,35 @@ func NewZkTrieImplWithRoot(storage ZktrieDatabase, rootHash *zkt.Hash, maxLevels
 }
 
 // Commit write all nodes to database
-func (mt *ZkTrieImpl) Commit() error {
+func (mt *ZkTrieImpl) Commit() (*zkt.Hash, int, error) {
 	var err error
-	mt.Root()
+	var commited int
+	rootHash := mt.Root()
 
 	if !mt.writable {
-		return ErrNotWritable
+		return nil, 0, ErrNotWritable
 	}
-	mt.root, err = mt.commit(mt.root)
+	mt.root, commited, err = mt.commit(mt.root)
 	if err != nil {
-		return err
+		return rootHash, commited, err
 	}
-	err = mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.Root()[:])
-	return err
+	err = mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, rootHash[:])
+	return rootHash, commited, err
 }
 
-func (mt *ZkTrieImpl) commit(n node) (node, error) {
+func (mt *ZkTrieImpl) commit(n node) (node, int, error) {
 	var err error
+	var commited int
 	switch n := n.(type) {
 	case *midNode:
 		if n.flags.dirty {
-			n.childL, err = mt.commit(n.childL)
+			n.childL, commited, err = mt.commit(n.childL)
 			if err != nil {
-				return n.childL, err
+				return n.childL, commited, err
 			}
-			n.childR, err = mt.commit(n.childR)
+			n.childR, commited, err = mt.commit(n.childR)
 			if err != nil {
-				return n.childR, err
+				return n.childR, commited, err
 			}
 
 			enc := n.CanonicalValue()
@@ -109,23 +111,23 @@ func (mt *ZkTrieImpl) commit(n node) (node, error) {
 			n.flags.dirty = false
 			cached := n.flags.cached
 			recyclingMidNode(n)
-			return cached, err
+			return cached, commited + 1, err
 		}
-		return n, nil
+		return n, 0, nil
 	case *leafNode:
 		enc := n.CanonicalValue()
 		k, err := n.Key()
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		err = mt.dbPut(k[:], enc)
-		return hashNode{k}, err
+		return hashNode{k}, 1, err
 	case *emptyNode:
-		return &Empty, nil
+		return &Empty, 0, nil
 	case hashNode:
-		return n, nil
+		return n, 0, nil
 	default:
-		return nil, ErrInvalidNodeFound
+		return nil, 0, ErrInvalidNodeFound
 	}
 }
 
@@ -417,42 +419,7 @@ func (mt *ZkTrieImpl) resolveHash(n hashNode, prefix []byte) (node, error) {
 	return nodeFromBytes(n, enc)
 }
 
-func (mt *ZkTrieImpl) tryGet(kHash *zkt.Hash) (*Node, []*zkt.Hash, error) {
-	path := getPath(mt.maxLevels, kHash[:])
-	nextKey := mt.Root()
-	var siblings []*zkt.Hash
-	for i := 0; i < mt.maxLevels; i++ {
-		n, err := mt.GetNode(nextKey)
-		if err != nil {
-			return nil, nil, err
-		}
-		switch n.Type {
-		case NodeTypeEmpty:
-			return NewNodeEmpty(), siblings, ErrKeyNotFound
-		case NodeTypeLeaf:
-			if bytes.Equal(kHash[:], n.NodeKey[:]) {
-				return n, siblings, nil
-			}
-			return n, siblings, ErrKeyNotFound
-		case NodeTypeMiddle:
-			if path[i] {
-				nextKey = n.ChildR
-				siblings = append(siblings, n.ChildL)
-			} else {
-				nextKey = n.ChildL
-				siblings = append(siblings, n.ChildR)
-			}
-		default:
-			return nil, nil, ErrInvalidNodeFound
-		}
-	}
-	return nil, siblings, ErrReachedMaxLevel
-}
-
-// TryGet returns the value for key stored in the trie.
-// The value bytes must not be modified by the caller.
-// If a node was not found in the database, a MissingNodeError is returned.
-func (mt *ZkTrieImpl) TryGet(kHash *zkt.Hash) ([]byte, error) {
+func (mt *ZkTrieImpl) tryGet(kHash *zkt.Hash) (node, error) {
 	var err error
 	path := getPath(mt.maxLevels, kHash[:])
 	n := mt.root
@@ -460,7 +427,7 @@ func (mt *ZkTrieImpl) TryGet(kHash *zkt.Hash) ([]byte, error) {
 		switch nd := n.(type) {
 		case *leafNode:
 			if bytes.Equal((*nd.NodeKey)[:], (*kHash)[:]) {
-				return nd.Data(), nil
+				return nd, nil
 			}
 			return nil, ErrKeyNotFound
 		case *midNode:
@@ -478,10 +445,22 @@ func (mt *ZkTrieImpl) TryGet(kHash *zkt.Hash) ([]byte, error) {
 		case *emptyNode:
 			return nil, ErrKeyNotFound
 		default:
-			return nil, ErrInvalidNodeFound
+			panic(fmt.Sprintf("%T: invalid node: %v", n, n))
 		}
 	}
-	return nil, ErrKeyNotFound
+	return nil, ErrReachedMaxLevel
+}
+
+// TryGet returns the value for key stored in the trie.
+// The value bytes must not be modified by the caller.
+// If a node was not found in the database, a MissingNodeError is returned.
+func (mt *ZkTrieImpl) TryGet(kHash *zkt.Hash) ([]byte, error) {
+	n, err := mt.tryGet(kHash)
+	if err == ErrKeyNotFound {
+		// according to https://github.com/ethereum/go-ethereum/blob/37f9d25ba027356457953eab5f181c98b46e9988/trie/trie.go#L135
+		return nil, nil
+	}
+	return n.(*leafNode).Data(), err
 }
 
 // dbInsert is a helper function to insert a node into a key in an open db
@@ -499,36 +478,18 @@ func (mt *ZkTrieImpl) dbPut(k []byte, v []byte) error {
 // GetLeafNode is more underlying method than TryGet, which obtain an leaf node
 // or nil if not exist
 func (mt *ZkTrieImpl) GetLeafNode(kHash *zkt.Hash) (*Node, error) {
-	var err error
-	path := getPath(mt.maxLevels, kHash[:])
-	n := mt.root
-	for i := 0; i < mt.maxLevels; i++ {
-		if hn, ok := n.(hashNode); ok {
-			n, err = mt.resolveHash(hn, nil)
-			if err != nil {
-				return nil, err
-			}
-		}
-		switch pn := n.(type) {
-		case *leafNode:
-			if bytes.Equal(kHash[:], pn.NodeKey[:]) {
-				return NewNodeLeaf(kHash, pn.CompressedFlags, pn.ValuePreimage), nil
-			} else {
-				return nil, ErrKeyNotFound
-			}
-		case *midNode:
-			if path[i] {
-				n = pn.childR
-			} else {
-				n = pn.childL
-			}
-		case nil:
-			return nil, ErrKeyNotFound
-		default:
-			return nil, ErrInvalidNodeFound
-		}
+	n, err := mt.tryGet(kHash)
+	if err != nil {
+		return nil, err
 	}
-	return nil, ErrReachedMaxLevel
+
+	if pn, ok := n.(*leafNode); ok {
+		nn := NewNodeLeaf(kHash, pn.CompressedFlags, pn.ValuePreimage)
+		nn.Key() //this will caculate the key
+		return nn, nil
+	} else {
+		panic("ZkTrieImpl.tryGet should always return a leafNode")
+	}
 }
 
 // GetNode gets a node by key from the MT.  Empty nodes are not stored in the
