@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync"
 
 	zkt "github.com/scroll-tech/zktrie/types"
 )
@@ -47,10 +48,11 @@ var (
 // ZkTrieImpl is the struct with the main elements of the ZkTrieImpl
 type ZkTrieImpl struct {
 	db        ZktrieDatabase
-	rootKey   *zkt.Hash
 	writable  bool
 	maxLevels int
 	Debug     bool
+	root      node
+	unhashed  int
 }
 
 func NewZkTrieImpl(storage ZktrieDatabase, maxLevels int) (*ZkTrieImpl, error) {
@@ -59,27 +61,130 @@ func NewZkTrieImpl(storage ZktrieDatabase, maxLevels int) (*ZkTrieImpl, error) {
 
 // NewZkTrieImplWithRoot loads a new ZkTrieImpl. If in the storage already exists one
 // will open that one, if not, will create a new one.
-func NewZkTrieImplWithRoot(storage ZktrieDatabase, root *zkt.Hash, maxLevels int) (*ZkTrieImpl, error) {
-	mt := ZkTrieImpl{db: storage, maxLevels: maxLevels, writable: true}
-	mt.rootKey = root
-	if *root != zkt.HashZero {
-		_, err := mt.GetNode(mt.rootKey)
+func NewZkTrieImplWithRoot(storage ZktrieDatabase, rootHash *zkt.Hash, maxLevels int) (*ZkTrieImpl, error) {
+	mt := ZkTrieImpl{db: storage, maxLevels: maxLevels, writable: true, root: hashNode{rootHash}}
+	if *rootHash != zkt.HashZero {
+		_, err := mt.GetNode(rootHash)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		mt.root = &Empty
 	}
 	return &mt, nil
 }
 
-// Root returns the MerkleRoot
-func (mt *ZkTrieImpl) Root() *zkt.Hash {
-	if mt.Debug {
-		_, err := mt.GetNode(mt.rootKey)
-		if err != nil {
-			panic(fmt.Errorf("load trie root failed hash %v", mt.rootKey.Bytes()))
-		}
+// Commit write all nodes to database
+func (mt *ZkTrieImpl) Commit() (*zkt.Hash, int, error) {
+	var err error
+	var commited int
+	rootHash := mt.Root()
+
+	if !mt.writable {
+		return nil, 0, ErrNotWritable
 	}
-	return mt.rootKey
+	mt.root, commited, err = mt.commit(mt.root)
+	if err != nil {
+		return rootHash, commited, err
+	}
+	err = mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, rootHash[:])
+	return rootHash, commited, err
+}
+
+func (mt *ZkTrieImpl) commit(n node) (node, int, error) {
+	var err error
+	var commited int
+	switch n := n.(type) {
+	case *midNode:
+		if n.flags.dirty {
+			n.childL, commited, err = mt.commit(n.childL)
+			if err != nil {
+				return n.childL, commited, err
+			}
+			n.childR, commited, err = mt.commit(n.childR)
+			if err != nil {
+				return n.childR, commited, err
+			}
+
+			enc := n.CanonicalValue()
+			err = mt.dbPut(n.flags.cached.Hash[:], enc)
+			n.flags.dirty = false
+			cached := n.flags.cached
+			recyclingMidNode(n)
+			return cached, commited + 1, err
+		}
+		return n, 0, nil
+	case *leafNode:
+		enc := n.CanonicalValue()
+		k, err := n.Key()
+		if err != nil {
+			return nil, 0, err
+		}
+		err = mt.dbPut(k[:], enc)
+		return hashNode{k}, 1, err
+	case *emptyNode:
+		return &Empty, 0, nil
+	case hashNode:
+		return n, 0, nil
+	default:
+		return nil, 0, ErrInvalidNodeFound
+	}
+}
+
+func (mt *ZkTrieImpl) Root() *zkt.Hash {
+	var root *zkt.Hash
+	if mt.unhashed >= 100 {
+		root = mt.hashRoot(mt.root, 16)
+	} else {
+		root = mt.hashRoot(mt.root, 0)
+	}
+	mt.unhashed = 0
+	return root
+}
+
+func (mt *ZkTrieImpl) hashRoot(n node, parallel int) *zkt.Hash {
+	switch n := n.(type) {
+	case *midNode:
+		if n.flags.cached.Hash == nil {
+			var left, right *zkt.Hash
+			if parallel >= 2 {
+				var wg sync.WaitGroup
+				wg.Add(2)
+				go func() {
+					left = mt.hashRoot(n.childL, parallel/2)
+					wg.Done()
+				}()
+				go func() {
+					right = mt.hashRoot(n.childR, parallel-parallel/2)
+					wg.Done()
+				}()
+				wg.Wait()
+			} else {
+				left = mt.hashRoot(n.childL, 0)
+				right = mt.hashRoot(n.childR, 0)
+			}
+
+			r, err := zkt.HashElems(left.BigInt(), right.BigInt())
+			// fmt.Println(left.Hex()[:8], ",", right.Hex()[:8], "=>", r.Hex()[:8])
+			if err != nil {
+				panic("zkt.HashElems fail")
+			}
+			n.flags.cached = hashNode{r}
+		}
+		return n.flags.cached.Hash
+	case hashNode:
+		return n.Hash
+	case *leafNode:
+		h, err := n.Key()
+		if err != nil {
+			panic("leafNode Key() error")
+		}
+		return h
+	case *emptyNode:
+		return &zkt.HashZero
+	default:
+		panic("ErrInvalidNodeFound")
+	}
 }
 
 // MaxLevels returns the MT maximum level
@@ -90,6 +195,7 @@ func (mt *ZkTrieImpl) MaxLevels() int {
 // tryUpdate update a Key & Value into the ZkTrieImpl. Where the `k` determines the
 // path from the Root to the Leaf. This also return the updated leaf node
 func (mt *ZkTrieImpl) TryUpdate(kHash *zkt.Hash, vFlag uint32, vPreimage []zkt.Byte32) error {
+
 	// verify that the ZkTrieImpl is writable
 	if !mt.writable {
 		return ErrNotWritable
@@ -100,28 +206,94 @@ func (mt *ZkTrieImpl) TryUpdate(kHash *zkt.Hash, vFlag uint32, vPreimage []zkt.B
 		return ErrInvalidField
 	}
 
-	newNodeLeaf := NewNodeLeaf(kHash, vFlag, vPreimage)
+	//newNodeLeaf := NewNodeLeaf(kHash, vFlag, vPreimage)
+	newNodeLeaf := leafNode{NodeKey: kHash, CompressedFlags: vFlag, ValuePreimage: vPreimage}
 	path := getPath(mt.maxLevels, kHash[:])
 
 	// precalc Key of new leaf here
 	if _, err := newNodeLeaf.Key(); err != nil {
 		return err
 	}
-
-	newRootKey, err := mt.addLeaf(newNodeLeaf, mt.rootKey, 0, path, true)
+	ok, newRoot, err := mt.insert(mt.root, &newNodeLeaf, kHash, 0, path, true)
+	if ok {
+		mt.unhashed++
+	}
 	// sanity check
 	if err == ErrEntryIndexAlreadyExists {
 		panic("Encounter unexpected errortype: ErrEntryIndexAlreadyExists")
 	} else if err != nil {
 		return err
 	}
-	mt.rootKey = newRootKey
-	err = mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.rootKey[:])
-	if err != nil {
-		return err
+	mt.root = newRoot
+	return nil
+}
+
+func (mt *ZkTrieImpl) delRecursive(n node, kHash *zkt.Hash, path []bool, lvl int) (bool, node, error) {
+	var err error
+	if hnode, ok := n.(hashNode); ok {
+		n, err = mt.resolveHash(hnode, nil)
+		if err != nil {
+			return false, n, err
+		}
 	}
 
-	return nil
+	switch n := n.(type) {
+	case *leafNode:
+		if bytes.Equal(n.NodeKey[:], kHash[:]) {
+			return true, &Empty, nil
+		} else { //not found
+			return false, n, ErrKeyNotFound
+		}
+	case *midNode:
+		var dirty bool
+		if path[lvl] {
+			dirty, n.childR, err = mt.delRecursive(n.childR, kHash, path, lvl+1)
+			if err != nil {
+				return false, n, err
+			}
+			if hnode, ok := n.childL.(hashNode); ok {
+				n.childL, err = mt.resolveHash(hnode, nil)
+				if err != nil {
+					return false, n, err
+				}
+			}
+		} else {
+			dirty, n.childL, err = mt.delRecursive(n.childL, kHash, path, lvl+1)
+			if err != nil {
+				return false, n, err
+			}
+			if hnode, ok := n.childR.(hashNode); ok {
+				n.childR, err = mt.resolveHash(hnode, nil)
+				if err != nil {
+					return false, n, err
+				}
+			}
+		}
+		if dirty {
+			n.flags = mt.newFlag()
+			//if childL is leaf and childR is nil,should "collapse"
+			if _, isEmpty := n.childR.(*emptyNode); isEmpty {
+				if _, ok := n.childL.(*leafNode); ok {
+					return true, n.childL, nil
+				}
+			}
+			//if childR is leaf and childL is nil,should "collapse"
+			if _, isEmpty := n.childL.(*emptyNode); isEmpty {
+				if _, isLeaf := n.childR.(*leafNode); isLeaf {
+					return true, n.childR, nil
+				}
+			}
+		}
+		return dirty, n, nil
+	case *emptyNode:
+		return false, &Empty, ErrKeyNotFound
+	default:
+		//return false, n, ErrInvalidNodeFound
+		panic("ErrInvalidNodeFound")
+	}
+}
+func (mt *ZkTrieImpl) TryDelete(kHash *zkt.Hash) error {
+	return mt.tryDeleteLite(kHash)
 }
 
 func (mt *ZkTrieImpl) tryDeleteLite(kHash *zkt.Hash) error {
@@ -134,412 +306,190 @@ func (mt *ZkTrieImpl) tryDeleteLite(kHash *zkt.Hash) error {
 	if !zkt.CheckBigIntInField(kHash.BigInt()) {
 		return ErrInvalidField
 	}
-
 	path := getPath(mt.maxLevels, kHash[:])
 
-	nextKey := mt.rootKey
-	siblings := []*zkt.Hash{}
-	for i := 0; i < mt.maxLevels; i++ {
-		n, err := mt.GetNode(nextKey)
-		if err != nil {
-			return err
-		}
-		switch n.Type {
-		case NodeTypeEmpty:
-			return ErrKeyNotFound
-		case NodeTypeLeaf:
-			if bytes.Equal(kHash[:], n.NodeKey[:]) {
-				// remove and go up with the sibling
-				newRootKey, err := mt.recalculatePathUntilRoot(path, NewNodeEmpty(), siblings)
-				if err != nil {
-					return err
-				}
-				mt.rootKey = newRootKey
-				return mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.rootKey[:])
-			}
-			return ErrKeyNotFound
-		case NodeTypeMiddle:
-			if path[i] {
-				nextKey = n.ChildR
-				siblings = append(siblings, n.ChildL)
-			} else {
-				nextKey = n.ChildL
-				siblings = append(siblings, n.ChildR)
-			}
-		default:
-			return ErrInvalidNodeFound
-		}
+	ok, newRoot, err := mt.delRecursive(mt.root, kHash, path, 0)
+	if err != nil {
+		return err
 	}
-
-	return ErrKeyNotFound
+	mt.root = newRoot
+	if ok {
+		mt.unhashed++
+	}
+	return nil
 }
 
-// pushLeaf recursively pushes an existing oldLeaf down until its path diverges
-// from newLeaf, at which point both leafs are stored, all while updating the
-// path.
-func (mt *ZkTrieImpl) pushLeaf(newLeaf *Node, oldLeaf *Node, lvl int,
-	pathNewLeaf []bool, pathOldLeaf []bool) (*zkt.Hash, error) {
-	if lvl > mt.maxLevels-2 {
-		return nil, ErrReachedMaxLevel
-	}
-	var newNodeMiddle *Node
-	if pathNewLeaf[lvl] == pathOldLeaf[lvl] { // We need to go deeper!
-		nextKey, err := mt.pushLeaf(newLeaf, oldLeaf, lvl+1, pathNewLeaf, pathOldLeaf)
-		if err != nil {
-			return nil, err
-		}
-		if pathNewLeaf[lvl] { // go right
-			newNodeMiddle = NewNodeMiddle(&zkt.HashZero, nextKey)
-		} else { // go left
-			newNodeMiddle = NewNodeMiddle(nextKey, &zkt.HashZero)
-		}
-		return mt.addNode(newNodeMiddle)
-	}
-	oldLeafKey, err := oldLeaf.Key()
-	if err != nil {
-		return nil, err
-	}
-	newLeafKey, err := newLeaf.Key()
-	if err != nil {
-		return nil, err
-	}
-
-	if pathNewLeaf[lvl] {
-		newNodeMiddle = NewNodeMiddle(oldLeafKey, newLeafKey)
-	} else {
-		newNodeMiddle = NewNodeMiddle(newLeafKey, oldLeafKey)
-	}
-	// We can add newLeaf now.  We don't need to add oldLeaf because it's
-	// already in the tree.
-	_, err = mt.addNode(newLeaf)
-	if err != nil {
-		return nil, err
-	}
-	return mt.addNode(newNodeMiddle)
+func (t *ZkTrieImpl) newFlag() nodeFlag {
+	return nodeFlag{dirty: true}
 }
 
-// addLeaf recursively adds a newLeaf in the MT while updating the path.
-func (mt *ZkTrieImpl) addLeaf(newLeaf *Node, key *zkt.Hash,
-	lvl int, path []bool, forceUpdate bool) (*zkt.Hash, error) {
-	var err error
-	var nextKey *zkt.Hash
+func (mt *ZkTrieImpl) insert(n node, newLeaf *leafNode, key *zkt.Hash,
+	lvl int, path []bool, forceUpdate bool) (bool, node, error) {
 	if lvl > mt.maxLevels-1 {
-		return nil, ErrReachedMaxLevel
+		return false, nil, ErrReachedMaxLevel
 	}
-	n, err := mt.GetNode(key)
+	switch n := n.(type) {
+	case *emptyNode:
+		return true, newLeaf, nil
+	case *midNode:
+		var dirty bool
+		var err error
+
+		if path[lvl] {
+			dirty, n.childR, err = mt.insert(n.childR, newLeaf, key, lvl+1, path, forceUpdate)
+			if err != nil {
+				return false, nil, err
+			}
+		} else {
+			dirty, n.childL, err = mt.insert(n.childL, newLeaf, key, lvl+1, path, forceUpdate)
+			if err != nil {
+				return false, nil, err
+			}
+		}
+		n.flags = mt.newFlag()
+		return dirty, n, nil
+	case hashNode:
+		nodeExpanded, err := mt.resolveHash(n, nil)
+		if err != nil {
+			return false, nil, err
+		}
+		return mt.insert(nodeExpanded, newLeaf, key, lvl, path, forceUpdate)
+	case *leafNode:
+		// exists key,replace or ignore
+		if bytes.Equal(newLeaf.NodeKey[:], n.NodeKey[:]) {
+			kOld, err := n.Key()
+			if err != nil {
+				return false, nil, err
+			}
+			kNew, err := newLeaf.Key()
+			if err != nil {
+				return false, nil, err
+			}
+
+			if bytes.Equal(kOld[:], kNew[:]) {
+				return false, n, nil
+			} else {
+				if forceUpdate {
+					return true, newLeaf, nil
+				} else {
+					return false, nil, ErrEntryIndexAlreadyExists
+				}
+			}
+		}
+		//
+		pathOldLeaf := getPath(mt.maxLevels, n.NodeKey[:])
+		top := midNodePool.Get().(*midNode)
+
+		pre := top
+		i := lvl
+		for ; i < mt.maxLevels && path[i] == pathOldLeaf[i]; i++ {
+			nm := midNodePool.Get().(*midNode)
+			if path[i] {
+				pre.childR = nm
+			} else {
+				pre.childL = nm
+			}
+			pre = nm
+		}
+		if i == mt.maxLevels {
+			return false, nil, ErrReachedMaxLevel
+		}
+		if path[i] {
+			pre.childR = newLeaf
+			pre.childL = n
+		} else {
+			pre.childR = n
+			pre.childL = newLeaf
+		}
+		return true, top, nil
+
+	default:
+		return false, nil, ErrInvalidNodeFound
+	}
+}
+
+func (mt *ZkTrieImpl) resolveHash(n hashNode, prefix []byte) (node, error) {
+	if bytes.Equal(n.Hash[:], zkt.HashZero[:]) {
+		return &Empty, nil
+	}
+	enc, err := mt.db.Get(n.Hash[:])
 	if err != nil {
-		fmt.Printf("addLeaf:GetNode err %v key %v root %v level %v\n", err, key, mt.rootKey, lvl)
-		fmt.Printf("root %v\n", mt.Root())
 		return nil, err
 	}
-	switch n.Type {
-	case NodeTypeEmpty:
-		// We can add newLeaf now
-		{
-			r, e := mt.addNode(newLeaf)
-			if e != nil {
-				fmt.Println("err on NodeTypeEmpty mt.addNode ", e)
+	return nodeFromBytes(n, enc)
+}
+
+func (mt *ZkTrieImpl) tryGet(kHash *zkt.Hash) (node, error) {
+	var err error
+	path := getPath(mt.maxLevels, kHash[:])
+	n := mt.root
+	for i := 0; i < mt.maxLevels; {
+		switch nd := n.(type) {
+		case *leafNode:
+			if bytes.Equal((*nd.NodeKey)[:], (*kHash)[:]) {
+				return nd, nil
 			}
-			return r, e
-		}
-	case NodeTypeLeaf:
-		// Check if leaf node found contains the leaf node we are
-		// trying to add
-		if bytes.Equal(n.NodeKey[:], newLeaf.NodeKey[:]) {
-			k, err := n.Key()
+			return nil, ErrKeyNotFound
+		case *midNode:
+			if path[i] {
+				n = nd.childR
+			} else {
+				n = nd.childL
+			}
+			i++
+		case hashNode:
+			n, err = mt.resolveHash(nd, nil)
 			if err != nil {
-				fmt.Println("err on obtain key of duplicated entry", err)
 				return nil, err
 			}
-			if bytes.Equal(k[:], newLeaf.key[:]) {
-				// do nothing, duplicate entry
-				// FIXME more optimization may needed here
-				return k, nil
-			} else if forceUpdate {
-				return mt.updateNode(newLeaf)
-			}
-
-			fmt.Printf("ErrEntryIndexAlreadyExists nodeKey %v n.Key() %v newLeaf.Key() %v\n",
-				n.NodeKey, k, newLeaf.key)
-			return nil, ErrEntryIndexAlreadyExists
-
-		}
-		pathOldLeaf := getPath(mt.maxLevels, n.NodeKey[:])
-		// We need to push newLeaf down until its path diverges from
-		// n's path
-		return mt.pushLeaf(newLeaf, n, lvl, path, pathOldLeaf)
-	case NodeTypeMiddle:
-		// We need to go deeper, continue traversing the tree, left or
-		// right depending on path
-		var newNodeMiddle *Node
-		if path[lvl] { // go right
-			nextKey, err = mt.addLeaf(newLeaf, n.ChildR, lvl+1, path, forceUpdate)
-			newNodeMiddle = NewNodeMiddle(n.ChildL, nextKey)
-		} else { // go left
-			nextKey, err = mt.addLeaf(newLeaf, n.ChildL, lvl+1, path, forceUpdate)
-			newNodeMiddle = NewNodeMiddle(nextKey, n.ChildR)
-		}
-		if err != nil {
-			fmt.Printf("addLeaf:GetNode err %v level %v\n", err, lvl)
-			return nil, err
-		}
-		// Update the node to reflect the modified child
-		return mt.addNode(newNodeMiddle)
-	default:
-		return nil, ErrInvalidNodeFound
-	}
-}
-
-// addNode adds a node into the MT.  Empty nodes are not stored in the tree;
-// they are all the same and assumed to always exist.
-func (mt *ZkTrieImpl) addNode(n *Node) (*zkt.Hash, error) {
-	// verify that the ZkTrieImpl is writable
-	if !mt.writable {
-		return nil, ErrNotWritable
-	}
-	if n.Type == NodeTypeEmpty {
-		return n.Key()
-	}
-	k, err := n.Key()
-	if err != nil {
-		return nil, err
-	}
-	v := n.CanonicalValue()
-	// Check that the node key doesn't already exist
-	oldV, err := mt.db.Get(k[:])
-	if err == nil {
-		if !bytes.Equal(oldV, v) {
-			fmt.Printf("fail on conflicted key: %v, old value %x and new %x\n", k, oldV, v)
-			return nil, ErrNodeKeyAlreadyExists
-		} else {
-			// duplicated
-			return k, nil
-		}
-	}
-	err = mt.db.Put(k[:], v)
-	return k, err
-}
-
-// updateNode updates an existing node in the MT.  Empty nodes are not stored
-// in the tree; they are all the same and assumed to always exist.
-func (mt *ZkTrieImpl) updateNode(n *Node) (*zkt.Hash, error) {
-	// verify that the ZkTrieImpl is writable
-	if !mt.writable {
-		return nil, ErrNotWritable
-	}
-	if n.Type == NodeTypeEmpty {
-		return n.Key()
-	}
-	k, err := n.Key()
-	if err != nil {
-		return nil, err
-	}
-	v := n.CanonicalValue()
-	err = mt.db.Put(k[:], v)
-	return k, err
-}
-
-func (mt *ZkTrieImpl) tryGet(kHash *zkt.Hash) (*Node, []*zkt.Hash, error) {
-
-	path := getPath(mt.maxLevels, kHash[:])
-	nextKey := mt.rootKey
-	var siblings []*zkt.Hash
-	for i := 0; i < mt.maxLevels; i++ {
-		n, err := mt.GetNode(nextKey)
-		if err != nil {
-			return nil, nil, err
-		}
-		switch n.Type {
-		case NodeTypeEmpty:
-			return NewNodeEmpty(), siblings, ErrKeyNotFound
-		case NodeTypeLeaf:
-			if bytes.Equal(kHash[:], n.NodeKey[:]) {
-				return n, siblings, nil
-			}
-			return n, siblings, ErrKeyNotFound
-		case NodeTypeMiddle:
-			if path[i] {
-				nextKey = n.ChildR
-				siblings = append(siblings, n.ChildL)
-			} else {
-				nextKey = n.ChildL
-				siblings = append(siblings, n.ChildR)
-			}
+		case *emptyNode:
+			return nil, ErrKeyNotFound
 		default:
-			return nil, nil, ErrInvalidNodeFound
+			panic(fmt.Sprintf("%T: invalid node: %v", n, n))
 		}
 	}
-
-	return nil, siblings, ErrReachedMaxLevel
+	return nil, ErrReachedMaxLevel
 }
 
 // TryGet returns the value for key stored in the trie.
 // The value bytes must not be modified by the caller.
 // If a node was not found in the database, a MissingNodeError is returned.
 func (mt *ZkTrieImpl) TryGet(kHash *zkt.Hash) ([]byte, error) {
-
-	node, _, err := mt.tryGet(kHash)
+	n, err := mt.tryGet(kHash)
 	if err == ErrKeyNotFound {
 		// according to https://github.com/ethereum/go-ethereum/blob/37f9d25ba027356457953eab5f181c98b46e9988/trie/trie.go#L135
 		return nil, nil
-	} else if err != nil {
-		return nil, err
 	}
-	return node.Data(), nil
-}
-
-// Delete removes the specified Key from the ZkTrieImpl and updates the path
-// from the deleted key to the Root with the new values.  This method removes
-// the key from the ZkTrieImpl, but does not remove the old nodes from the
-// key-value database; this means that if the tree is accessed by an old Root
-// where the key was not deleted yet, the key will still exist. If is desired
-// to remove the key-values from the database that are not under the current
-// Root, an option could be to dump all the leafs (using mt.DumpLeafs) and
-// import them in a new ZkTrieImpl in a new database (using
-// mt.ImportDumpedLeafs), but this will lose all the Root history of the
-// ZkTrieImpl
-func (mt *ZkTrieImpl) TryDelete(kHash *zkt.Hash) error {
-	// verify that the ZkTrieImpl is writable
-	if !mt.writable {
-		return ErrNotWritable
-	}
-
-	// verify that k is valid and fit inside the Finite Field.
-	if !zkt.CheckBigIntInField(kHash.BigInt()) {
-		return ErrInvalidField
-	}
-
-	path := getPath(mt.maxLevels, kHash[:])
-
-	nextKey := mt.rootKey
-	siblings := []*zkt.Hash{}
-	for i := 0; i < mt.maxLevels; i++ {
-		n, err := mt.GetNode(nextKey)
-		if err != nil {
-			return err
-		}
-		switch n.Type {
-		case NodeTypeEmpty:
-			return ErrKeyNotFound
-		case NodeTypeLeaf:
-			if bytes.Equal(kHash[:], n.NodeKey[:]) {
-				// remove and go up with the sibling
-				err = mt.rmAndUpload(path, kHash, siblings)
-				return err
-			}
-			return ErrKeyNotFound
-		case NodeTypeMiddle:
-			if path[i] {
-				nextKey = n.ChildR
-				siblings = append(siblings, n.ChildL)
-			} else {
-				nextKey = n.ChildL
-				siblings = append(siblings, n.ChildR)
-			}
-		default:
-			return ErrInvalidNodeFound
-		}
-	}
-
-	return ErrKeyNotFound
-}
-
-// rmAndUpload removes the key, and goes up until the root updating all the
-// nodes with the new values.
-func (mt *ZkTrieImpl) rmAndUpload(path []bool, kHash *zkt.Hash, siblings []*zkt.Hash) error {
-	if len(siblings) == 0 {
-		mt.rootKey = &zkt.HashZero
-		err := mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.rootKey[:])
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-
-	toUpload := siblings[len(siblings)-1]
-	if len(siblings) < 2 { //nolint:gomnd
-		mt.rootKey = siblings[0]
-		err := mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.rootKey[:])
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-	for i := len(siblings) - 2; i >= 0; i-- { //nolint:gomnd
-		if !bytes.Equal(siblings[i][:], zkt.HashZero[:]) {
-			var newNode *Node
-			if path[i] {
-				newNode = NewNodeMiddle(siblings[i], toUpload)
-			} else {
-				newNode = NewNodeMiddle(toUpload, siblings[i])
-			}
-			_, err := mt.addNode(newNode)
-			if err != ErrNodeKeyAlreadyExists && err != nil {
-				return err
-			}
-			// go up until the root
-			newRootKey, err := mt.recalculatePathUntilRoot(path, newNode,
-				siblings[:i])
-			if err != nil {
-				return err
-			}
-			mt.rootKey = newRootKey
-			err = mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.rootKey[:])
-			if err != nil {
-				return err
-			}
-			break
-		}
-		// if i==0 (root position), stop and store the sibling of the
-		// deleted leaf as root
-		if i == 0 {
-			mt.rootKey = toUpload
-			err := mt.dbInsert(dbKeyRootNode, DBEntryTypeRoot, mt.rootKey[:])
-			if err != nil {
-				return err
-			}
-			break
-		}
-	}
-	return nil
-}
-
-// recalculatePathUntilRoot recalculates the nodes until the Root
-func (mt *ZkTrieImpl) recalculatePathUntilRoot(path []bool, node *Node,
-	siblings []*zkt.Hash) (*zkt.Hash, error) {
-	for i := len(siblings) - 1; i >= 0; i-- {
-		nodeKey, err := node.Key()
-		if err != nil {
-			return nil, err
-		}
-		if path[i] {
-			node = NewNodeMiddle(siblings[i], nodeKey)
-		} else {
-			node = NewNodeMiddle(nodeKey, siblings[i])
-		}
-		_, err = mt.addNode(node)
-		if err != ErrNodeKeyAlreadyExists && err != nil {
-			return nil, err
-		}
-	}
-
-	// return last node added, which is the root
-	nodeKey, err := node.Key()
-	return nodeKey, err
+	return n.(*leafNode).Data(), err
 }
 
 // dbInsert is a helper function to insert a node into a key in an open db
 // transaction.
 func (mt *ZkTrieImpl) dbInsert(k []byte, t NodeType, data []byte) error {
 	v := append([]byte{byte(t)}, data...)
+	return mt.dbPut(k, v)
+}
+
+func (mt *ZkTrieImpl) dbPut(k []byte, v []byte) error {
+	//fmt.Println("Put:", common.Bytes2Hex(k), ":", common.Bytes2Hex(v))
 	return mt.db.Put(k, v)
 }
 
 // GetLeafNode is more underlying method than TryGet, which obtain an leaf node
 // or nil if not exist
-func (mt *ZkTrieImpl) GetLeafNode(key *zkt.Hash) (*Node, error) {
-	n, _, err := mt.tryGet(key)
-	return n, err
+func (mt *ZkTrieImpl) GetLeafNode(kHash *zkt.Hash) (*Node, error) {
+	n, err := mt.tryGet(kHash)
+	if err != nil {
+		return nil, err
+	}
+
+	if pn, ok := n.(*leafNode); ok {
+		nn := NewNodeLeaf(kHash, pn.CompressedFlags, pn.ValuePreimage)
+		nn.Key() //this will caculate the key
+		return nn, nil
+	} else {
+		panic("ZkTrieImpl.tryGet should always return a leafNode")
+	}
 }
 
 // GetNode gets a node by key from the MT.  Empty nodes are not stored in the
@@ -655,7 +605,6 @@ func VerifyProofZkTrie(rootKey *zkt.Hash, proof *Proof, node *Node) bool {
 // Verify the proof and calculate the root, key can be nil when try to verify
 // an nonexistent proof
 func (proof *Proof) Verify(key, kHash *zkt.Hash) (*zkt.Hash, error) {
-
 	if proof.Existence {
 		if key == nil {
 			return nil, ErrKeyNotFound

@@ -31,31 +31,35 @@ func (mt *ZkTrieImpl) prove(kHash *zkt.Hash, fromLevel uint, writeNode func(*Nod
 
 	path := getPath(mt.maxLevels, kHash[:])
 	var nodes []*Node
-	tn := mt.rootKey
+	var err error
+	mt.Root()
+	n := mt.root
+
 	for i := 0; i < mt.maxLevels; i++ {
-		n, err := mt.GetNode(tn)
-		if err != nil {
-			return err
+		finished := true
+		if nh, ok := n.(hashNode); ok {
+			n, err = mt.resolveHash(nh, nil)
+			if err != nil {
+				return err
+			}
 		}
 
-		finished := true
-		switch n.Type {
-		case NodeTypeEmpty:
-		case NodeTypeLeaf:
-			// notice even we found a leaf whose entry didn't match the expected k,
-			// we still include it as the proof of absence
-		case NodeTypeMiddle:
+		switch tn := n.(type) {
+		case *leafNode:
+			nodes = append(nodes, toNode(n))
+		case *emptyNode:
+		case *midNode:
+			nodes = append(nodes, toNode(n))
 			finished = false
 			if path[i] {
-				tn = n.ChildR
+				n = tn.childR
 			} else {
-				tn = n.ChildL
+				n = tn.childL
 			}
 		default:
 			return ErrInvalidNodeFound
 		}
 
-		nodes = append(nodes, n)
 		if finished {
 			break
 		}
@@ -76,4 +80,21 @@ func (mt *ZkTrieImpl) prove(kHash *zkt.Hash, fromLevel uint, writeNode func(*Nod
 	}
 
 	return nil
+}
+
+func toNode(n node) *Node {
+	switch tn := n.(type) {
+	case *midNode:
+		l, _ := tn.childL.Key()
+		r, _ := tn.childR.Key()
+		return NewNodeMiddle(l, r)
+	case *emptyNode:
+		return NewNodeEmpty()
+	case *leafNode:
+		return NewNodeLeaf(tn.NodeKey, tn.CompressedFlags, tn.ValuePreimage)
+	case hashNode:
+		return nil
+	default:
+		return nil
+	}
 }
